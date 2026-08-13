@@ -573,9 +573,14 @@ def mis_reservas(client, atras=CAL_DIAS_ATRAS, adelante=CAL_DIAS):
     como [(clase, AAAAMMDD)]. Reservada = con bookState.
 
     Los dias pasados salen de _CAL_DIAS_CACHE, asi que un refresco normal son
-    'adelante' consultas y no las ~100 de la ventana entera."""
+    'adelante' consultas y no las ~100 de la ventana entera.
+
+    El barrido no se fia de /api/bookings para saber si la sesion sigue viva:
+    con la cookie caducada responde el horario igual, solo que sin bookState en
+    ninguna clase, que aqui es indistinguible de 'no tienes nada reservado'. Por
+    eso se confirma con /api/whoami antes de dar el barrido por bueno."""
     hoy = datetime.now()
-    reservas = []
+    reservas, congelables = [], {}
     for delta in range(-atras, adelante):
         dia = (hoy + timedelta(days=delta)).strftime("%Y%m%d")
         pasado = delta < 0
@@ -584,8 +589,21 @@ def mis_reservas(client, atras=CAL_DIAS_ATRAS, adelante=CAL_DIAS):
             clases = [c for c in client.get_schedule(dia).get("bookings", [])
                       if c.get("bookState")]
             if pasado:
-                _CAL_DIAS_CACHE[dia] = clases
+                # Aun no a la cache: si la sesion se cayo a mitad del barrido,
+                # esto son dias vacios y congelarlos los perderia para siempre.
+                congelables[dia] = clases
         reservas += [(clase, dia) for clase in clases]
+
+    try:
+        client.verificar_sesion()
+    except SessionExpired:
+        raise
+    except RuntimeError as e:
+        # verificar_sesion() distingue mal login de sesion caida; para quien
+        # llama las dos son lo mismo, un barrido que hay que repetir tras entrar.
+        raise SessionExpired(f"/api/whoami no confirma la sesion: {e}") from e
+
+    _CAL_DIAS_CACHE.update(congelables)
     _olvida_dias_viejos(hoy, atras)
     return reservas
 
@@ -669,6 +687,32 @@ def construye_ics(reservas, nombre=CAL_NOMBRE):
     return "\r\n".join(_pliega(l) for l in lineas) + "\r\n"
 
 
+def _cliente_calendario():
+    """Cliente del calendario con la sesion ya comprobada.
+
+    La cookie dura pocas horas y el calendario no reserva nada, asi que nada la
+    renovaba: el scheduler refresca la suya antes de cada apertura, pero esta se
+    quedaba caducada para siempre. Y como el .ics solo consulta /api/bookings,
+    que no devuelve logout, el fallo no se veia -- el calendario seguia dando
+    200 con el historial congelado en cache y nada de hoy en adelante.
+
+    Comprobar aqui ademas evita barrer ~100 dias para tirarlos: mis_reservas
+    tambien confirma la sesion al final, pero eso es para el caso raro de que se
+    caiga a mitad del barrido."""
+    global _CAL_CLIENTE
+
+    if _CAL_CLIENTE is None:
+        _CAL_CLIENTE = cliente_desde_config()
+        _CAL_CLIENTE.login()
+        return _CAL_CLIENTE
+    try:
+        _CAL_CLIENTE.verificar_sesion()
+    except (SessionExpired, RuntimeError) as e:
+        print(f"[CAL] Sesion caducada ({type(e).__name__}); re-login.", flush=True)
+        _CAL_CLIENTE.login()
+    return _CAL_CLIENTE
+
+
 def calendario_ics():
     """Texto del .ics, cacheado CAL_TTL_SECONDS.
 
@@ -676,20 +720,16 @@ def calendario_ics():
     hilos, y un re-login lanzado desde el hilo HTTP en plena ventana de reserva
     dejaria al scheduler sin sesion. El lock ademas evita que varias peticiones
     simultaneas de iOS disparen ocho consultas cada una."""
-    global _CAL_CLIENTE
-
     with _CAL_LOCK:
         if _CAL_CACHE["texto"] is not None and time.time() - _CAL_CACHE["ts"] < CAL_TTL_SECONDS:
             return _CAL_CACHE["texto"]
 
-        if _CAL_CLIENTE is None:
-            _CAL_CLIENTE = cliente_desde_config()
-            _CAL_CLIENTE.login()
+        cliente = _cliente_calendario()
         try:
-            reservas = mis_reservas(_CAL_CLIENTE)
+            reservas = mis_reservas(cliente)
         except SessionExpired:
-            _CAL_CLIENTE.login()
-            reservas = mis_reservas(_CAL_CLIENTE)
+            cliente.login()
+            reservas = mis_reservas(cliente)
 
         texto = construye_ics(reservas)
         _CAL_CACHE.update(ts=time.time(), texto=texto)
