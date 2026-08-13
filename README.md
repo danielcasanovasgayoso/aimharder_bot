@@ -263,12 +263,21 @@ https://<tu-app>.fly.dev/cal/<token>.ics
 | Caché | 15 min para el `.ics` (`CAL_TTL_SECONDS`); los días pasados se guardan aparte y no se vuelven a consultar |
 | Arranque | Al arrancar se precalienta el historial en segundo plano, para que la primera petición del iPhone no tenga que hacer ~100 consultas seguidas |
 | Horas | En UTC dentro del `.ics`; el iPhone las muestra en tu zona |
-| Sesión | Cliente propio, separado del scheduler, para no tocar su sesión desde el hilo HTTP |
+| Sesión | Cliente propio, separado del scheduler, para no tocar su sesión desde el hilo HTTP. Se comprueba con `/api/whoami` en cada refresco y se renueva sola |
 
 El historial se congela: un día ya vivido no puede cambiar, así que se consulta
 una vez y se guarda. Es solo una optimización — la API devuelve el `bookState`
 de días pasados, así que un despliegue no pierde el historial, solo lo vuelve a
 pedir. Las clases de más de 90 días desaparecen del calendario.
+
+**La sesión del calendario se comprueba, no se supone.** `/api/bookings`
+responde el horario igual con la cookie caducada, solo que sin `bookState` en
+ninguna clase — indistinguible de «no tienes nada reservado». Por eso cada
+refresco pregunta antes a `/api/whoami`, que sí devuelve `logout`, y vuelve a
+entrar si hace falta; y por eso un día pasado no se congela en la caché hasta
+que la sesión queda confirmada al terminar el barrido. Sin esto, unas horas
+después de arrancar el `.ics` se servía con 200, con el historial congelado
+intacto y **sin nada de hoy en adelante**.
 
 **iOS refresca los calendarios suscritos cuando quiere** (Ajustes → Calendario →
 Cuentas → Obtener datos), como mínimo cada 15 min y a veces más lento. Una

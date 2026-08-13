@@ -70,6 +70,10 @@ class ClienteFalso(bot.AimHarderClient):
             raise bot.SessionExpired("{'logout': 1}")
         return {"bookState": 1, "id": class_id}
 
+    def verificar_sesion(self):
+        # Sin esto, mis_reservas saldria a /api/whoami de verdad.
+        return {"id": 1, "name": "Falso"}
+
 
 class RespuestaFalsa(io.BytesIO):
     """Respuesta de red simulada, para no tocar la API real en los tests."""
@@ -245,6 +249,52 @@ def main():
     bot._CAL_DIAS_CACHE.clear()
     print("16 los dias fuera de la ventana se olvidan, la cache no crece sola")
 
+    class Caducado(ClienteFalso):
+        """Sesion perdida: /api/bookings responde el horario igual, solo que sin
+        bookState, y solo /api/whoami delata que no hay sesion."""
+
+        def __init__(self):
+            super().__init__()
+            self.viva = False
+
+        def login(self, verify=True):
+            super().login(verify)
+            self.viva = True
+
+        def verificar_sesion(self):
+            if not self.viva:
+                raise bot.SessionExpired("{'logout': 1}")
+            return {"id": 1, "name": "Falso"}
+
+        def get_schedule(self, day):
+            clase = {"id": 1, "className": "Crossfit", "time": "18:10 - 19:10"}
+            if self.viva:
+                clase["bookState"] = 1
+            return {"bookings": [clase]}
+
+    bot._CAL_DIAS_CACHE.clear()
+    caducado = Caducado()
+    try:
+        bot.mis_reservas(caducado, atras=2, adelante=1)
+        raise AssertionError("un barrido sin sesion no puede darse por bueno")
+    except bot.SessionExpired:
+        pass
+    assert bot._CAL_DIAS_CACHE == {}, bot._CAL_DIAS_CACHE
+    print("17 la sesion caida no congela un historial vacio en la cache")
+
+    bot._CAL_CACHE.update(ts=0, texto=None)
+    bot._CAL_CLIENTE = caducado
+    try:
+        ics = bot.calendario_ics()
+        assert caducado.logins == 1, caducado.logins
+        esperado = bot.CAL_DIAS_ATRAS + bot.CAL_DIAS
+        assert ics.count("BEGIN:VEVENT") == esperado, ics.count("BEGIN:VEVENT")
+    finally:
+        bot._CAL_CLIENTE = None
+        bot._CAL_CACHE.update(ts=0, texto=None)
+        bot._CAL_DIAS_CACHE.clear()
+    print("18 con la sesion caducada el .ics re-loguea en vez de servirse vacio")
+
     servidor = bot.ThreadingHTTPServer(("127.0.0.1", 0), bot.HealthHandler)
     threading.Thread(target=servidor.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{servidor.server_address[1]}"
@@ -256,7 +306,7 @@ def main():
                 raise AssertionError(f"{ruta} deberia dar 404")
             except urllib.error.HTTPError as e:
                 assert e.code == 404, (ruta, e.code)
-        print("17 sin AIMHARDER_CAL_TOKEN el calendario no existe (404), la salud si")
+        print("19 sin AIMHARDER_CAL_TOKEN el calendario no existe (404), la salud si")
 
         # El endpoint de salud no lleva token: no puede decir a que clase vas.
         reserva(ClienteFalso())
@@ -275,7 +325,7 @@ def main():
         bot._HEARTBEAT["fatal"] = None
     finally:
         servidor.shutdown()
-    print("18 el endpoint publico no publica la agenda ni el detalle del error")
+    print("20 el endpoint publico no publica la agenda ni el detalle del error")
 
     assert bot._targets_desde_entorno("") == []
     with contextlib.redirect_stdout(io.StringIO()):
@@ -290,7 +340,7 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()):
         salen = bot._targets_desde_entorno(crudo)
     assert salen == [{"weekday": 1, "time": "07:00", "name_contains": "Metcon"}], salen
-    print("19 AIMHARDER_TARGETS: se descarta lo invalido sin tumbar el arranque")
+    print("21 AIMHARDER_TARGETS: se descarta lo invalido sin tumbar el arranque")
 
     vacio = {"email": "", "password": "", "box_subdomain": "", "box_id": 0, "targets": []}
     assert bot.config_incompleta(vacio) == ["AIMHARDER_EMAIL", "AIMHARDER_PASSWORD",
@@ -298,7 +348,7 @@ def main():
                                             "AIMHARDER_TARGETS"]
     assert bot.config_incompleta(CFG) == []
     assert bot.config_incompleta(dict(CFG, targets=[])) == ["AIMHARDER_TARGETS"]
-    print("20 config_incompleta nombra las variables que faltan, sin valores")
+    print("22 config_incompleta nombra las variables que faltan, sin valores")
 
     print("\nTodo en verde.")
 
