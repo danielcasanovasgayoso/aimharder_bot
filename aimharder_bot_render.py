@@ -19,6 +19,7 @@ los horarios estan en el repo: ver CONFIG.
     AIMHARDER_BOX           obligatoria; subdominio del box
     AIMHARDER_BOX_ID        obligatoria; id numerico del box
     AIMHARDER_TARGETS       obligatoria; JSON con las clases objetivo
+    AIMHARDER_PAUSES        opcional; JSON con los dias sin reservas
     AIMHARDER_CAL_TOKEN     opcional; sin ella el calendario no existe
     AIMHARDER_FINGERPRINT   opcional; por defecto se deriva del email
 
@@ -112,6 +113,66 @@ def _targets_desde_entorno(crudo):
     return validos
 
 
+def _rango_de_pausa(texto):
+    """Un rango 'AAAA-MM-DD:AAAA-MM-DD' -> (date, date), o None si no vale.
+    Una fecha suelta, 'AAAA-MM-DD', es el rango de un solo dia."""
+    partes = [p.strip() for p in str(texto).split(":")]
+    if len(partes) == 1:
+        partes *= 2
+    if len(partes) != 2:
+        return None
+    try:
+        inicio, fin = (datetime.strptime(p, "%Y-%m-%d").date() for p in partes)
+    except ValueError:
+        return None
+    return (inicio, fin) if inicio <= fin else None
+
+
+def _pausas_desde_entorno(crudo):
+    """AIMHARDER_PAUSES son los periodos en los que no se reserva nada
+    -- vacaciones, un viaje, una lesion --, como lista JSON de rangos con los
+    dos extremos incluidos:
+
+        ["2026-09-05:2026-09-27", "2026-12-24"]
+
+    Las fechas son las de LAS CLASES, no las del momento de reservar, y esa es
+    la distincion que hace que esto sirva de algo. La reserva se abre 7 dias
+    antes: las clases de la primera semana fuera se reservan cuando uno todavia
+    esta en casa, y las de la semana de vuelta se reservan estando fuera.
+    Apagar el bot se equivoca en los dos extremos -- deja reservada la ida y
+    pierde la vuelta --; filtrar por la fecha de la clase, en ninguno.
+
+    Un rango invalido se descarta con un aviso y los demas siguen, igual que
+    con los targets. Los ya pasados no estorban: se pueden dejar puestos."""
+    if not crudo.strip():
+        return []
+    try:
+        datos = json.loads(crudo)
+    except json.JSONDecodeError as e:
+        print(f"[CONFIG] AIMHARDER_PAUSES no es JSON valido: {e}", flush=True)
+        return []
+    if not isinstance(datos, list):
+        print("[CONFIG] AIMHARDER_PAUSES tiene que ser una lista JSON.", flush=True)
+        return []
+
+    pausas = []
+    for entrada in datos:
+        rango = _rango_de_pausa(entrada)
+        if rango:
+            pausas.append(rango)
+        else:
+            # El valor no se vuelca: una pausa dice cuando no estas en casa.
+            print("[CONFIG] Pausa descartada, formato invalido "
+                  "('AAAA-MM-DD' o 'AAAA-MM-DD:AAAA-MM-DD', con fin >= inicio).",
+                  flush=True)
+    return pausas
+
+
+def en_pausa(dia, pausas):
+    """dia es un date, y los dos extremos de cada rango cuentan como pausa."""
+    return any(inicio <= dia <= fin for inicio, fin in pausas)
+
+
 CONFIG = {
     "email": os.environ.get("AIMHARDER_EMAIL", "").strip(),
     "password": os.environ.get("AIMHARDER_PASSWORD", ""),
@@ -121,7 +182,16 @@ CONFIG = {
     "poll_interval_seconds": 0.5,
     "retry_window_seconds": 30,
     "targets": _targets_desde_entorno(os.environ.get("AIMHARDER_TARGETS", "")),
+    "pauses": _pausas_desde_entorno(os.environ.get("AIMHARDER_PAUSES", "")),
 }
+
+
+# --- Pausas ---------------------------------------------------------------
+# Un rango absurdo -- o un dedazo en el ano -- no puede dejar a next_opening
+# saltando ocurrencias para siempre: pasado el horizonte se rinde, y el
+# scheduler lo dice por los logs en vez de colgarse sin que nadie lo reinicie.
+HORIZONTE_SEMANAS = 105        # ~2 anos de ocurrencias semanales
+PAUSA_RECHECK_SECONDS = 3600   # cada cuanto se reintenta si no queda ninguna
 
 
 # --- Sesion ---------------------------------------------------------------
@@ -357,16 +427,22 @@ def next_class_datetime(target, after):
     return candidate
 
 
-def next_opening(target, book_days_before, after):
+def next_opening(target, book_days_before, after, pausas=()):
+    """Primera ocurrencia reservable del target -> (apertura, clase).
+
+    Se salta dos cosas. Las que tienen la ventana ya abierta, que hay que
+    reservar a mano: dejarlas devolveria una apertura en el pasado y el bucle
+    de reservas giraria sin esperar. Y las que caen en una pausa, mirando la
+    fecha de LA CLASE y no la de la apertura -- ver _pausas_desde_entorno().
+
+    Devuelve None si no queda ninguna dentro del horizonte."""
     class_dt = next_class_datetime(target, after)
-    opening_dt = class_dt - timedelta(days=book_days_before)
-    # Con la ventana ya abierta esa clase hay que reservarla a mano: se salta a
-    # la ocurrencia de la semana siguiente, para no dejar una apertura en el
-    # pasado y que el bucle de reservas gire sin esperar.
-    while opening_dt <= after:
-        class_dt += timedelta(days=7)
+    for _ in range(HORIZONTE_SEMANAS):
         opening_dt = class_dt - timedelta(days=book_days_before)
-    return opening_dt, class_dt
+        if opening_dt > after and not en_pausa(class_dt.date(), pausas):
+            return opening_dt, class_dt
+        class_dt += timedelta(days=7)
+    return None
 
 
 def sleep_until(dt, status=None):
@@ -384,10 +460,13 @@ def cliente_desde_config(config=CONFIG):
 
 
 def proximo_objetivo(config, ahora):
-    """La apertura mas cercana de todos los targets -> (apertura, clase, target)."""
-    candidatos = [next_opening(t, config["book_days_before"], ahora) + (t,)
-                  for t in config["targets"]]
-    return min(candidatos, key=lambda c: c[0])
+    """La apertura mas cercana de todos los targets -> (apertura, clase, target),
+    o None si ninguno tiene ocurrencia reservable dentro del horizonte."""
+    pausas = config.get("pauses") or ()
+    candidatos = [ocurrencia + (t,) for t in config["targets"]
+                  if (ocurrencia := next_opening(t, config["book_days_before"],
+                                                 ahora, pausas))]
+    return min(candidatos, key=lambda c: c[0]) if candidatos else None
 
 
 def imprimir_horario(bookings, prefijo):
@@ -476,7 +555,17 @@ def startup_diagnostic(client, config):
     """Una sola lectura al arrancar: confirma que las horas y los nombres de
     los targets casan con lo que devuelve la API. No reserva nada."""
     ahora = datetime.now()
-    _, class_dt, target = proximo_objetivo(config, ahora)
+    for inicio, fin in config.get("pauses") or ():
+        marca = " -- ya pasada" if fin < ahora.date() else ""
+        print(f"[DIAG] Pausa del {inicio} al {fin}, incluidos: ninguna clase de "
+              f"esos dias se reserva{marca}.", flush=True)
+
+    siguiente = proximo_objetivo(config, ahora)
+    if siguiente is None:
+        print(f"[DIAG] AVISO: ningun objetivo tiene apertura en las proximas "
+              f"{HORIZONTE_SEMANAS} semanas. Revisa AIMHARDER_PAUSES.", flush=True)
+        return
+    _, class_dt, target = siguiente
     day_str = class_dt.strftime("%Y%m%d")
 
     print(f"[DIAG] Hora local del contenedor: {ahora:%Y-%m-%d %H:%M:%S} "
@@ -502,6 +591,42 @@ def startup_diagnostic(client, config):
     else:
         print(f"[DIAG] AVISO: ninguna clase casa con '{target['name_contains']}' a las "
               f"{target['time']}. Revisa AIMHARDER_TARGETS.", flush=True)
+
+
+def avisa_reservas_en_pausa(client, config):
+    """Avisa por los logs de las clases ya reservadas que caen en una pausa.
+
+    Poner la pausa con menos de book_days_before dias de margen llega tarde
+    para lo que el bot ya reservo: esas reservas siguen en pie. El bot no las
+    anula -- cancelar no es cosa de un bot que reserva, y una pausa mal escrita
+    borraria clases de verdad --, asi que se nombran y se anulan desde la app.
+
+    Solo se consultan los dias en pausa que caen dentro de la ventana de
+    reserva: fuera de vacaciones esto no cuesta ni una peticion."""
+    pausas = config.get("pauses") or ()
+    if not pausas:
+        return
+    hoy = datetime.now()
+    revisados = avisadas = 0
+    for delta in range(config["book_days_before"] + 1):
+        dia = hoy + timedelta(days=delta)
+        if not en_pausa(dia.date(), pausas):
+            continue
+        day_str = dia.strftime("%Y%m%d")
+        revisados += 1
+        try:
+            clases = client.get_schedule(day_str).get("bookings", [])
+        except Exception as e:
+            print(f"[PAUSA] No se pudo revisar {day_str}: {e!r}", flush=True)
+            continue
+        for clase in (c for c in clases if c.get("bookState")):
+            avisadas += 1
+            print(f"[PAUSA] Ya tenias reservada {clase.get('className')} "
+                  f"{clase.get('time')} del {day_str}, que cae en pausa. "
+                  "El bot no cancela nada: anulala desde la app.", flush=True)
+    if revisados and not avisadas:
+        print(f"[PAUSA] {revisados} dias en pausa dentro de la ventana de "
+              "reserva, sin nada reservado en ellos.", flush=True)
 
 
 def config_incompleta(config):
@@ -535,16 +660,30 @@ def scheduler_loop(config):
     client.login()
     print("[DIAG] login() verificado contra la API.", flush=True)
     startup_diagnostic(client, config)
+    avisa_reservas_en_pausa(client, config)
 
     while True:
-        opening_dt, class_dt, target = proximo_objetivo(config, datetime.now())
+        # La fase que se sirve por el endpoint publico es la misma con pausa y
+        # sin ella. Un "de vacaciones" ahi diria a cualquiera que pase por la
+        # URL que no estas en casa, que es exactamente lo que no se publica.
+        espera = "esperando a la proxima apertura"
+        siguiente = proximo_objetivo(config, datetime.now())
+        if siguiente is None:
+            # Con todos los targets en pausa mas alla del horizonte no hay nada
+            # que esperar, pero tampoco es un error: los secretos cambian en
+            # caliente cuando Fly reinicia, asi que se vuelve a mirar.
+            print(f"[PAUSA] Ningun objetivo tiene apertura en las proximas "
+                  f"{HORIZONTE_SEMANAS} semanas. Revisa AIMHARDER_PAUSES. "
+                  f"Se reintenta en {PAUSA_RECHECK_SECONDS // 60} min.", flush=True)
+            sleep_until(datetime.now() + timedelta(seconds=PAUSA_RECHECK_SECONDS), espera)
+            continue
+        opening_dt, class_dt, target = siguiente
 
         # Con la zona horaria explicita: el visor de logs de Fly marca cada
         # linea en UTC, y en verano eso son 2 h menos que la hora del bot.
         print(f"Proxima apertura: {target} -> {opening_dt:%Y-%m-%d %H:%M} "
               f"{datetime.now().astimezone().tzname()}", flush=True)
         # Fecha y clase se quedan en los logs. Ver beat().
-        espera = "esperando a la proxima apertura"
 
         # Despertar antes de la apertura para llegar a la ventana con una
         # sesion recien hecha: entre dos aperturas pueden pasar dias.
