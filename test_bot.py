@@ -350,6 +350,99 @@ def main():
     assert bot.config_incompleta(dict(CFG, targets=[])) == ["AIMHARDER_TARGETS"]
     print("22 config_incompleta nombra las variables que faltan, sin valores")
 
+    # --- pausas -----------------------------------------------------------
+    def fecha(y, m, d):
+        return bot.datetime(y, m, d).date()
+
+    assert bot._pausas_desde_entorno("") == []
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert bot._pausas_desde_entorno("{no json") == []
+        assert bot._pausas_desde_entorno('"2026-09-05"') == []
+        salen = bot._pausas_desde_entorno(json.dumps([
+            "2026-09-05:2026-09-27",   # rango normal
+            "2026-12-24",              # un dia suelto
+            "2026-13-01",              # mes imposible
+            "2026-09-27:2026-09-05",   # del reves
+            "5 de septiembre",         # no es una fecha
+        ]))
+    assert salen == [(fecha(2026, 9, 5), fecha(2026, 9, 27)),
+                     (fecha(2026, 12, 24), fecha(2026, 12, 24))], salen
+    print("23 AIMHARDER_PAUSES: rangos y dias sueltos, lo invalido se descarta")
+
+    vacaciones = [(fecha(2026, 9, 5), fecha(2026, 9, 27))]
+    assert bot.en_pausa(fecha(2026, 9, 5), vacaciones), "el primer dia entra"
+    assert bot.en_pausa(fecha(2026, 9, 27), vacaciones), "el ultimo dia entra"
+    assert not bot.en_pausa(fecha(2026, 9, 4), vacaciones)
+    assert not bot.en_pausa(fecha(2026, 9, 28), vacaciones)
+    assert not bot.en_pausa(fecha(2026, 9, 10), [])
+    print("24 en_pausa incluye los dos extremos del rango")
+
+    # Jueves 13/08/2026. Del target de los martes, la primera ocurrencia con la
+    # ventana aun cerrada es la clase del 25/08 (apertura el 18/08).
+    ahora = bot.datetime(2026, 8, 13, 9, 0)
+    martes = CFG["targets"][0]
+    apertura, clase = bot.next_opening(martes, 7, ahora)
+    assert (apertura, clase) == (bot.datetime(2026, 8, 18, 7, 0),
+                                 bot.datetime(2026, 8, 25, 7, 0)), (apertura, clase)
+
+    apertura, clase = bot.next_opening(martes, 7, ahora,
+                                       [(fecha(2026, 8, 25), fecha(2026, 8, 25))])
+    assert clase == bot.datetime(2026, 9, 1, 7, 0), clase
+    print("25 una clase en pausa se salta a la ocurrencia de la semana siguiente")
+
+    # Lo que decide es la fecha de la CLASE, no la de la apertura: la clase del
+    # 01/09 se reserva el 25/08, en plena pausa, y aun asi hay que reservarla.
+    apertura, clase = bot.next_opening(martes, 7, ahora,
+                                       [(fecha(2026, 8, 20), fecha(2026, 8, 26))])
+    assert clase == bot.datetime(2026, 9, 1, 7, 0), clase
+    assert apertura == bot.datetime(2026, 8, 25, 7, 0), apertura
+    assert bot.en_pausa(apertura.date(), [(fecha(2026, 8, 20), fecha(2026, 8, 26))])
+    print("26 la vuelta se reserva aunque la apertura caiga dentro de la pausa")
+
+    # Tres semanas fuera: ni el martes 25/08 ni los siguientes hasta el 08/09.
+    tres_semanas = dict(CFG, pauses=[(fecha(2026, 8, 20), fecha(2026, 9, 9))])
+    apertura, clase, objetivo = bot.proximo_objetivo(tres_semanas, ahora)
+    assert clase.date() > fecha(2026, 9, 9), clase
+    assert objetivo["weekday"] == 3 and clase == bot.datetime(2026, 9, 10, 20, 0), (objetivo, clase)
+    assert bot.proximo_objetivo(CFG, ahora)[1] == bot.datetime(2026, 8, 20, 20, 0)
+    print("27 con tres semanas en pausa el siguiente objetivo es el de la vuelta")
+
+    eterna = dict(CFG, pauses=[(fecha(2026, 8, 13), fecha(2099, 1, 1))])
+    assert bot.next_opening(martes, 7, ahora, eterna["pauses"]) is None
+    assert bot.proximo_objetivo(eterna, ahora) is None
+    print("28 una pausa mas larga que el horizonte no cuelga el scheduler")
+
+    class ContadorDias(ClienteFalso):
+        """Cuenta que dias se consultan al buscar reservas dentro de la pausa."""
+
+        def __init__(self):
+            super().__init__()
+            self.consultas = []
+
+        def get_schedule(self, day):
+            self.consultas.append(day)
+            return {"bookings": [
+                {"id": 1, "className": "Crossfit", "time": "18:10 - 19:10", "bookState": 1},
+                {"id": 2, "className": "Open Box", "time": "18:10 - 19:10"},
+            ]}
+
+    hoy = bot.datetime.now().date()
+    manana = hoy + bot.timedelta(days=1)
+    c = ContadorDias()
+    salida = io.StringIO()
+    with contextlib.redirect_stdout(salida):
+        bot.avisa_reservas_en_pausa(c, dict(CFG, pauses=[(manana, manana)]))
+    out = salida.getvalue()
+    assert c.consultas == [manana.strftime("%Y%m%d")], c.consultas
+    assert out.count("Ya tenias reservada") == 1 and "Crossfit" in out, out
+    assert "Open Box" not in out, out
+
+    c = ContadorDias()
+    with contextlib.redirect_stdout(io.StringIO()):
+        bot.avisa_reservas_en_pausa(c, CFG)
+    assert c.consultas == [], "sin pausas no se consulta nada"
+    print("29 avisa de lo ya reservado dentro de la pausa, sin salir de la ventana")
+
     print("\nTodo en verde.")
 
 

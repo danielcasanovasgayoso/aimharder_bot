@@ -36,6 +36,7 @@ todo entra por variables de entorno, que en Fly son secretos. Ver
 | `AIMHARDER_BOX` | sí | Subdominio del box, el de `<box>.aimharder.com` |
 | `AIMHARDER_BOX_ID` | sí | Id numérico del box (parámetro `box` de la API) |
 | `AIMHARDER_TARGETS` | sí | Clases objetivo, en JSON |
+| `AIMHARDER_PAUSES` | no | Días sin reservas, en JSON. Ver [Vacaciones](#vacaciones) |
 | `AIMHARDER_CAL_TOKEN` | no | Sin ella el calendario no existe. Ver [Calendario](#calendario-en-el-iphone) |
 | `AIMHARDER_FINGERPRINT` | no | Por defecto se deriva del email |
 
@@ -164,6 +165,66 @@ Esto sale por `flyctl logs`, que es privado, no por el endpoint HTTP.
 
 Si aparece `[DIAG] AVISO: ninguna clase casa con ...`, la hora o el nombre en
 `AIMHARDER_TARGETS` no coinciden con el horario real del box.
+
+## Vacaciones
+
+Para dejar de reservar unas semanas **no hay que apagar nada**: se declaran los
+días en `AIMHARDER_PAUSES` y el bot sigue vivo, con su calendario y su health
+check, saltándose las clases de esas fechas.
+
+```sh
+# Tres semanas fuera, del 5 al 27 de septiembre, los dos días incluidos.
+flyctl secrets set AIMHARDER_PAUSES='["2026-09-05:2026-09-27"]'
+```
+
+Es una lista JSON de rangos `AAAA-MM-DD:AAAA-MM-DD`. Una fecha suelta vale como
+rango de un día, y se pueden poner varios:
+
+```json
+["2026-09-05:2026-09-27", "2026-12-24", "2026-12-31"]
+```
+
+Al volver, `flyctl secrets unset AIMHARDER_PAUSES` — o dejarlo puesto: un rango
+que ya pasó no afecta a nada, así que sirve de historial.
+
+### Las fechas son las de la clase, no las de la reserva
+
+Es lo que distingue esto de apagar la máquina, y no es un detalle: la ventana de
+reserva se abre **7 días antes**, así que apagar el bot mientras estás fuera se
+equivoca en los dos extremos.
+
+| | Bot apagado durante el viaje | `AIMHARDER_PAUSES` |
+|---|---|---|
+| Clases de la primera semana fuera | **Ya reservadas** antes de salir, y ahí se quedan | No se reservan |
+| Clases de la semana de vuelta | **Perdidas**: su reserva se abría contigo fuera | Se reservan, aunque la apertura caiga en plena pausa |
+
+Por eso el filtro mira la fecha de la clase. La clase del 1 de octubre se
+reserva el 24 de septiembre, en mitad de la pausa, y hay que reservarla igual.
+
+### Si la pones con menos de una semana de margen
+
+Las clases de los próximos 7 días ya pueden estar reservadas: la pausa no las
+anula. El bot **no cancela nada** — cancelar no es cosa de un bot que reserva, y
+un rango mal escrito borraría clases de verdad —, pero al arrancar las nombra en
+los logs para que no se te pasen:
+
+```
+[PAUSA] Ya tenias reservada Metcon 07:00 - 08:00 del 20260908, que cae en pausa.
+        El bot no cancela nada: anulala desde la app.
+```
+
+Se anulan a mano desde la app de AimHarder. Los logs también listan las pausas
+activas al arrancar, que es la forma de comprobar que se han leído bien:
+
+```
+[DIAG] Pausa del 2026-09-05 al 2026-09-27, incluidos: ninguna clase de esos dias se reserva.
+Proxima apertura: {'weekday': 1, ...} -> 2026-09-22 07:00
+```
+
+Un rango con formato inválido se descarta con un aviso y los demás siguen
+funcionando, igual que con los targets. Y el health check público **no dice que
+estés de vacaciones**: sirve la misma fase genérica que cualquier otro día. Ver
+[Privacidad](#privacidad).
 
 ## Sesión
 
@@ -299,10 +360,13 @@ complemento también dice cuándo no estás en casa. De ahí estas reglas.
 | Contraseña | Evidente |
 | Box y `box_id` | Es tu ubicación física |
 | Horarios (`AIMHARDER_TARGETS`) | Es tu rutina semanal, a la hora exacta |
+| Vacaciones (`AIMHARDER_PAUSES`) | Son las fechas exactas en las que tu casa está vacía |
 
 **Fuera de las respuestas HTTP públicas:** el health check sirve una fase
 genérica y el tipo de una excepción, nunca la clase, la fecha ni el texto del
-error. Ver [Health check](#health-check).
+error. Tampoco cambia de fase durante una pausa: un «de vacaciones» en una URL
+sin token le diría a cualquiera que pase por ahí que no estás en casa. Ver
+[Health check](#health-check).
 
 **Público a propósito:** el hostname `<app>.fly.dev` (está en `fly.toml` porque
 `flyctl` lo necesita). No pasa nada: `/` ya no cuenta nada y `/cal` no existe sin
