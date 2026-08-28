@@ -837,7 +837,12 @@ def _cliente_calendario():
 
     Comprobar aqui ademas evita barrer ~100 dias para tirarlos: mis_reservas
     tambien confirma la sesion al final, pero eso es para el caso raro de que se
-    caiga a mitad del barrido."""
+    caiga a mitad del barrido.
+
+    Cada paso deja linea en los logs. El calendario es lo unico que habla
+    mientras el scheduler duerme dias enteros, asi que un 'sesion caducada'
+    suelto era todo lo que se veia de la maquina -- y salia igual tanto si el
+    re-login arreglaba las cosas como si el .ics llevaba horas dando 503."""
     global _CAL_CLIENTE
 
     if _CAL_CLIENTE is None:
@@ -846,9 +851,20 @@ def _cliente_calendario():
         return _CAL_CLIENTE
     try:
         _CAL_CLIENTE.verificar_sesion()
-    except (SessionExpired, RuntimeError) as e:
-        print(f"[CAL] Sesion caducada ({type(e).__name__}); re-login.", flush=True)
-        _CAL_CLIENTE.login()
+    except Exception as e:
+        # Ancho a proposito. Ademas de la sesion caida (SessionExpired) y del
+        # whoami sin usuario (RuntimeError), aqui caen un corte de red
+        # (URLError) o una pagina de error en vez de JSON (ValueError): la
+        # sesion tampoco queda confirmada, y antes se escapaban sin una linea.
+        print(f"[CAL] Sesion sin confirmar ({type(e).__name__}); re-login.", flush=True)
+        try:
+            _CAL_CLIENTE.login()
+        except Exception as fallo:
+            # Se propaga igual -- el handler responde 503 --, pero ahora
+            # habiendolo dicho.
+            print(f"[CAL] FALLO: el re-login tampoco funciono ({fallo!r}).", flush=True)
+            raise
+        print("[CAL] Re-login correcto; sesion de nuevo en pie.", flush=True)
     return _CAL_CLIENTE
 
 
