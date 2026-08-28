@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 os.environ["TZ"] = "Europe/Madrid"
@@ -295,6 +296,34 @@ def main():
         bot._CAL_DIAS_CACHE.clear()
     print("18 con la sesion caducada el .ics re-loguea en vez de servirse vacio")
 
+    class SinRed(ClienteFalso):
+        """Ni sesion confirmada ni re-login posible. URLError a proposito: no
+        es SessionExpired ni RuntimeError, y antes se escapaba sin log."""
+
+        def verificar_sesion(self):
+            raise urllib.error.URLError("timed out")
+
+        def login(self, verify=True):
+            raise RuntimeError("Login rechazado (HTTP 503)")
+
+    bot._CAL_CACHE.update(ts=0, texto=None)
+    bot._CAL_CLIENTE = SinRed()
+    salida = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(salida):
+            bot.calendario_ics()
+        raise AssertionError("un re-login fallido no puede darse por bueno")
+    except RuntimeError:
+        pass
+    finally:
+        bot._CAL_CLIENTE = None
+        bot._CAL_CACHE.update(ts=0, texto=None)
+        bot._CAL_DIAS_CACHE.clear()
+    logs = salida.getvalue()
+    assert "URLError" in logs, logs
+    assert "FALLO" in logs, logs
+    print("19 un re-login fallido lo dice en los logs, no se va en silencio")
+
     servidor = bot.ThreadingHTTPServer(("127.0.0.1", 0), bot.HealthHandler)
     threading.Thread(target=servidor.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{servidor.server_address[1]}"
@@ -306,7 +335,7 @@ def main():
                 raise AssertionError(f"{ruta} deberia dar 404")
             except urllib.error.HTTPError as e:
                 assert e.code == 404, (ruta, e.code)
-        print("19 sin AIMHARDER_CAL_TOKEN el calendario no existe (404), la salud si")
+        print("20 sin AIMHARDER_CAL_TOKEN el calendario no existe (404), la salud si")
 
         # El endpoint de salud no lleva token: no puede decir a que clase vas.
         reserva(ClienteFalso())
@@ -325,7 +354,7 @@ def main():
         bot._HEARTBEAT["fatal"] = None
     finally:
         servidor.shutdown()
-    print("20 el endpoint publico no publica la agenda ni el detalle del error")
+    print("21 el endpoint publico no publica la agenda ni el detalle del error")
 
     assert bot._targets_desde_entorno("") == []
     with contextlib.redirect_stdout(io.StringIO()):
@@ -340,7 +369,7 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()):
         salen = bot._targets_desde_entorno(crudo)
     assert salen == [{"weekday": 1, "time": "07:00", "name_contains": "Metcon"}], salen
-    print("21 AIMHARDER_TARGETS: se descarta lo invalido sin tumbar el arranque")
+    print("22 AIMHARDER_TARGETS: se descarta lo invalido sin tumbar el arranque")
 
     vacio = {"email": "", "password": "", "box_subdomain": "", "box_id": 0, "targets": []}
     assert bot.config_incompleta(vacio) == ["AIMHARDER_EMAIL", "AIMHARDER_PASSWORD",
@@ -348,7 +377,7 @@ def main():
                                             "AIMHARDER_TARGETS"]
     assert bot.config_incompleta(CFG) == []
     assert bot.config_incompleta(dict(CFG, targets=[])) == ["AIMHARDER_TARGETS"]
-    print("22 config_incompleta nombra las variables que faltan, sin valores")
+    print("23 config_incompleta nombra las variables que faltan, sin valores")
 
     # --- pausas -----------------------------------------------------------
     def fecha(y, m, d):
@@ -367,7 +396,7 @@ def main():
         ]))
     assert salen == [(fecha(2026, 9, 5), fecha(2026, 9, 27)),
                      (fecha(2026, 12, 24), fecha(2026, 12, 24))], salen
-    print("23 AIMHARDER_PAUSES: rangos y dias sueltos, lo invalido se descarta")
+    print("24 AIMHARDER_PAUSES: rangos y dias sueltos, lo invalido se descarta")
 
     vacaciones = [(fecha(2026, 9, 5), fecha(2026, 9, 27))]
     assert bot.en_pausa(fecha(2026, 9, 5), vacaciones), "el primer dia entra"
@@ -375,7 +404,7 @@ def main():
     assert not bot.en_pausa(fecha(2026, 9, 4), vacaciones)
     assert not bot.en_pausa(fecha(2026, 9, 28), vacaciones)
     assert not bot.en_pausa(fecha(2026, 9, 10), [])
-    print("24 en_pausa incluye los dos extremos del rango")
+    print("25 en_pausa incluye los dos extremos del rango")
 
     # Jueves 13/08/2026. Del target de los martes, la primera ocurrencia con la
     # ventana aun cerrada es la clase del 25/08 (apertura el 18/08).
@@ -388,7 +417,7 @@ def main():
     apertura, clase = bot.next_opening(martes, 7, ahora,
                                        [(fecha(2026, 8, 25), fecha(2026, 8, 25))])
     assert clase == bot.datetime(2026, 9, 1, 7, 0), clase
-    print("25 una clase en pausa se salta a la ocurrencia de la semana siguiente")
+    print("26 una clase en pausa se salta a la ocurrencia de la semana siguiente")
 
     # Lo que decide es la fecha de la CLASE, no la de la apertura: la clase del
     # 01/09 se reserva el 25/08, en plena pausa, y aun asi hay que reservarla.
@@ -397,7 +426,7 @@ def main():
     assert clase == bot.datetime(2026, 9, 1, 7, 0), clase
     assert apertura == bot.datetime(2026, 8, 25, 7, 0), apertura
     assert bot.en_pausa(apertura.date(), [(fecha(2026, 8, 20), fecha(2026, 8, 26))])
-    print("26 la vuelta se reserva aunque la apertura caiga dentro de la pausa")
+    print("27 la vuelta se reserva aunque la apertura caiga dentro de la pausa")
 
     # Tres semanas fuera: ni el martes 25/08 ni los siguientes hasta el 08/09.
     tres_semanas = dict(CFG, pauses=[(fecha(2026, 8, 20), fecha(2026, 9, 9))])
@@ -405,12 +434,12 @@ def main():
     assert clase.date() > fecha(2026, 9, 9), clase
     assert objetivo["weekday"] == 3 and clase == bot.datetime(2026, 9, 10, 20, 0), (objetivo, clase)
     assert bot.proximo_objetivo(CFG, ahora)[1] == bot.datetime(2026, 8, 20, 20, 0)
-    print("27 con tres semanas en pausa el siguiente objetivo es el de la vuelta")
+    print("28 con tres semanas en pausa el siguiente objetivo es el de la vuelta")
 
     eterna = dict(CFG, pauses=[(fecha(2026, 8, 13), fecha(2099, 1, 1))])
     assert bot.next_opening(martes, 7, ahora, eterna["pauses"]) is None
     assert bot.proximo_objetivo(eterna, ahora) is None
-    print("28 una pausa mas larga que el horizonte no cuelga el scheduler")
+    print("29 una pausa mas larga que el horizonte no cuelga el scheduler")
 
     class ContadorDias(ClienteFalso):
         """Cuenta que dias se consultan al buscar reservas dentro de la pausa."""
@@ -441,7 +470,7 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()):
         bot.avisa_reservas_en_pausa(c, CFG)
     assert c.consultas == [], "sin pausas no se consulta nada"
-    print("29 avisa de lo ya reservado dentro de la pausa, sin salir de la ventana")
+    print("30 avisa de lo ya reservado dentro de la pausa, sin salir de la ventana")
 
     print("\nTodo en verde.")
 
